@@ -1,6 +1,7 @@
 from . import whisper
 from .utils.ytdownloader import download_and_convert_to_mp3
 import argparse
+import os
 from rich.progress import Progress, TimeElapsedColumn, BarColumn, TextColumn
 import json
 import logging
@@ -68,11 +69,24 @@ parser.add_argument(
 parser.add_argument(
     "--output-file-name",
     required=False,
-    default="output.json",
+    default=None,
     type=str,
     metavar="FILE",
-    help="The output file name for the transcribed text JSON (default: output.json). "
-         "Will automatically append .json extension if not provided.",
+    help="The output file name for the transcribed text JSON. "
+         "If omitted, it is derived from the input audio file name. "
+         "Will automatically append .json extension if not provided. "
+         "An .srt file with the same base name is also written.",
+)
+
+parser.add_argument(
+    "--language",
+    required=False,
+    default=None,
+    type=str,
+    metavar="LANGUAGE",
+    help='Language spoken in the audio. Supplying this skips automatic language detection. '
+         'Use the two-letter ISO 639-1 code (e.g. "en", "fr", "de", "zh") or the full language '
+         'name (e.g. "english", "french").',
 )
 
 parser.add_argument(
@@ -86,20 +100,64 @@ parser.add_argument(
          'Options: DEBUG (most verbose), INFO (default), WARNING, ERROR, CRITICAL (least verbose).',
 )
 
-def worker(file_name,model_name,output_file_name):
+def _format_srt_timestamp(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    milliseconds = round(seconds * 1000.0)
+
+    hours = milliseconds // 3_600_000
+    milliseconds -= hours * 3_600_000
+
+    minutes = milliseconds // 60_000
+    milliseconds -= minutes * 60_000
+
+    secs = milliseconds // 1_000
+    milliseconds -= secs * 1_000
+
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+
+
+def _write_srt(segments, srt_path: str) -> None:
+    lines = []
+    index = 1
+    for segment in segments:
+        text = (segment.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+        lines.append(str(index))
+        lines.append(
+            f"{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}"
+        )
+        lines.append(text)
+        lines.append("")
+        index += 1
+
+    with open(srt_path, "w", encoding="utf8") as fp:
+        fp.write("\n".join(lines).rstrip() + "\n")
+
+
+def worker(file_name, model_name, output_file_name, language=None):
     with Progress(
         TextColumn("🤗 [progress.description]"),
         BarColumn(style="yellow1", pulse_style="white"),
         TimeElapsedColumn(),
     ) as progress:
         progress.add_task("[yellow]Transcribing...", total=None)
-        text = whisper.transcribe(file_name,model=model_name)
+        decode_options = {}
+        if language is not None:
+            decode_options["language"] = language
+        text = whisper.transcribe(file_name, model=model_name, **decode_options)
         logging.debug(f"Transcription result: {text}")
         with open(output_file_name, "w", encoding="utf8") as fp:
             json.dump(text, fp, ensure_ascii=False)
+        srt_path = os.path.splitext(output_file_name)[0] + ".srt"
+        _write_srt(text.get("segments", []), srt_path)
         logging.info(
             f"Voila!✨ Your file has been transcribed go check it out over here 👉 {output_file_name}"
         )
+        logging.info(f"SRT subtitles written to 👉 {srt_path}")
 
 def main():
     args = parser.parse_args()
@@ -115,15 +173,28 @@ def main():
     model_name = args.model_name
     youtube_url = args.youtube_url
     output_file_name = args.output_file_name
-    if not output_file_name.lower().endswith('.json'):
-        output_file_name = output_file_name + '.json'
+    def _derive_output_name(source_path: str) -> str:
+        base, _ = os.path.splitext(os.path.basename(source_path))
+        directory = os.path.dirname(source_path)
+        return os.path.join(directory, base + ".json")
+
+    language = args.language
+    if output_file_name is not None:
+        lower = output_file_name.lower()
+        if lower.endswith(".srt") or lower.endswith(".json"):
+            output_file_name = output_file_name[:-4] + ".json"
+        else:
+            output_file_name = output_file_name + ".json"
     if youtube_url is not None:
         logging.info(f'start downloading audios: {args.youtube_url}')
         audio_path = download_and_convert_to_mp3(youtube_url)
-        worker(audio_path,model_name,output_file_name)
+        if output_file_name is None:
+            output_file_name = _derive_output_name(audio_path)
+        worker(audio_path, model_name, output_file_name, language=language)
     else:
         if file_name is None:
             logging.error("local file_name should not be none!")
             return None
-        worker(file_name,model_name,output_file_name)    
-
+        if output_file_name is None:
+            output_file_name = _derive_output_name(file_name)
+        worker(file_name, model_name, output_file_name, language=language)
