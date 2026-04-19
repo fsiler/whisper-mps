@@ -120,9 +120,11 @@ def transcribe(
 
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
     model = ModelHolder.get_model(model, dtype)
+    mx.eval(model.parameters())
 
     # Pad 30-seconds of silence to the input audio, for slicing
     mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
+    mx.eval(mel)
     content_frames = mel.shape[-2] - N_FRAMES
 
     if verbose:
@@ -245,7 +247,9 @@ def transcribe(
             mel_segment = pad_or_trim(mel_segment, N_FRAMES, axis=-2).astype(dtype)
 
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
+            mx.eval(mel_segment)
             result: DecodingResult = decode_with_fallback(mel_segment)
+            mx.eval(model.parameters())
             tokens = np.array(result.tokens)
 
             if no_speech_threshold is not None:
