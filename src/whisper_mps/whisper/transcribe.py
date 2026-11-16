@@ -2,9 +2,10 @@
 
 import mlx.core as mx
 import numpy as np
+import os
 import sys
 import logging
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 import tqdm
 
 
@@ -18,6 +19,12 @@ from .audio import (
     pad_or_trim,
 )
 from .decoding import DecodingOptions, DecodingResult
+from ..long_audio import (
+    DEFAULT_CHUNK_SECONDS,
+    probe_audio_duration,
+    should_chunk_audio,
+    transcribe_chunked_audio,
+)
 from .load_models import load_model
 from .tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
 
@@ -65,6 +72,7 @@ def transcribe(
     no_speech_threshold: Optional[float] = 0.6,
     condition_on_previous_text: bool = True,
     initial_prompt: Optional[str] = None,
+    progress_callback: Optional[Callable[[float, float], None]] = None,
     prepend_punctuations: str = "\"'“¿([{-",
     append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
     **decode_options,
@@ -109,6 +117,10 @@ def transcribe(
         "prompt-engineer" a context for transcription, e.g. custom vocabularies or proper nouns
         to make it more likely to predict those word correctly.
 
+    progress_callback: Optional[Callable[[float, float], None]]
+        Optional callback receiving processed audio seconds and total audio seconds as each
+        segment is completed.
+
     decode_options: dict
         Keyword arguments to construct `DecodingOptions` instances
 
@@ -117,6 +129,33 @@ def transcribe(
     A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
+
+    if isinstance(audio, str) and os.path.isfile(audio):
+        audio_duration = probe_audio_duration(audio)
+        if should_chunk_audio(audio_duration):
+            chunk_options = {
+                "model": model,
+                "verbose": verbose,
+                "temperature": temperature,
+                "compression_ratio_threshold": compression_ratio_threshold,
+                "logprob_threshold": logprob_threshold,
+                "no_speech_threshold": no_speech_threshold,
+                "condition_on_previous_text": condition_on_previous_text,
+                "initial_prompt": initial_prompt,
+                "prepend_punctuations": prepend_punctuations,
+                "append_punctuations": append_punctuations,
+                **decode_options,
+            }
+            return transcribe_chunked_audio(
+                audio,
+                transcribe,
+                duration_seconds=audio_duration,
+                chunk_seconds=DEFAULT_CHUNK_SECONDS,
+                sample_rate=SAMPLE_RATE,
+                hop_length=HOP_LENGTH,
+                progress_callback=progress_callback,
+                **chunk_options,
+            )
 
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
     model = ModelHolder.get_model(model, dtype)
@@ -203,6 +242,14 @@ def transcribe(
         return decode_result
 
     seek = 0
+    total_duration = content_frames * HOP_LENGTH / SAMPLE_RATE
+
+    def report_progress() -> None:
+        if progress_callback is not None:
+            processed_duration = min(content_frames, seek) * HOP_LENGTH / SAMPLE_RATE
+            progress_callback(processed_duration, total_duration)
+
+    report_progress()
     input_stride = N_FRAMES // model.dims.n_audio_ctx  # mel frames per output token: 2
     time_precision = (
         input_stride * HOP_LENGTH / SAMPLE_RATE
@@ -263,7 +310,10 @@ def transcribe(
                     should_skip = False
 
                 if should_skip:
+                    previous_seek = seek
                     seek += segment_size  # fast-forward to the next segment boundary
+                    pbar.update(min(content_frames, seek) - previous_seek)
+                    report_progress()
                     continue
 
             previous_seek = seek
@@ -364,6 +414,7 @@ def transcribe(
 
             # update progress bar
             pbar.update(min(content_frames, seek) - previous_seek)
+            report_progress()
 
     return dict(
         text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),

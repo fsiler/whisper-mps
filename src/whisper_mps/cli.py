@@ -2,7 +2,15 @@ from . import whisper
 from .utils.ytdownloader import download_and_convert_to_mp3
 import argparse
 import os
-from rich.progress import Progress, TimeElapsedColumn, BarColumn, TextColumn
+import time
+from rich.progress import (
+    Progress,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
 import json
 import logging
 
@@ -140,20 +148,90 @@ def _write_srt(segments, srt_path: str) -> None:
 
 def worker(file_name, model_name, output_file_name, language=None):
     with Progress(
-        TextColumn("🤗 [progress.description]"),
+        TextColumn("[progress.description]{task.description}"),
         BarColumn(style="yellow1", pulse_style="white"),
+        TaskProgressColumn(),
         TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        TextColumn("{task.fields[speed]}"),
     ) as progress:
-        progress.add_task("[yellow]Transcribing...", total=None)
+        task_id = progress.add_task(
+            "[yellow]Preparing model/audio",
+            total=None,
+            speed="waiting for audio",
+        )
+        transcription_started = None
+        last_progress_log_at = None
+        total_duration = 0.0
+
+        def update_progress(processed_seconds, duration_seconds):
+            nonlocal transcription_started, last_progress_log_at, total_duration
+            now = time.perf_counter()
+            if transcription_started is None:
+                transcription_started = now
+                last_progress_log_at = now
+            total_duration = duration_seconds
+            elapsed = max(now - transcription_started, 1e-9)
+            speed = processed_seconds / elapsed
+            progress.update(
+                task_id,
+                total=max(duration_seconds, 0.001),
+                completed=processed_seconds,
+                description="[cyan]Transcribing",
+                speed=f"{speed:.1f}× realtime",
+            )
+            if now - last_progress_log_at >= 60:
+                percent = 100.0 * processed_seconds / max(duration_seconds, 1e-9)
+                logging.info(
+                    "Transcription progress: %.1f%% (%.1f / %.1f audio minutes, %.1f× realtime)",
+                    percent,
+                    processed_seconds / 60,
+                    duration_seconds / 60,
+                    speed,
+                )
+                last_progress_log_at = now
+
         decode_options = {}
         if language is not None:
             decode_options["language"] = language
-        text = whisper.transcribe(file_name, model=model_name, **decode_options)
-        logging.debug(f"Transcription result: {text}")
-        with open(output_file_name, "w", encoding="utf8") as fp:
-            json.dump(text, fp, ensure_ascii=False)
-        srt_path = os.path.splitext(output_file_name)[0] + ".srt"
-        _write_srt(text.get("segments", []), srt_path)
+        try:
+            text = whisper.transcribe(
+                file_name,
+                model=model_name,
+                progress_callback=update_progress,
+                **decode_options,
+            )
+            transcription_elapsed = max(
+                time.perf_counter() - transcription_started,
+                1e-9,
+            )
+            logging.debug(f"Transcription result: {text}")
+            with open(output_file_name, "w", encoding="utf8") as fp:
+                json.dump(text, fp, ensure_ascii=False)
+            srt_path = os.path.splitext(output_file_name)[0] + ".srt"
+            _write_srt(text.get("segments", []), srt_path)
+        except KeyboardInterrupt:
+            progress.update(
+                task_id,
+                description="[yellow]Interrupted",
+                speed="cancelled",
+            )
+            raise
+        except Exception:
+            progress.update(
+                task_id,
+                description="[red]Transcription failed",
+                speed="failed",
+            )
+            raise
+        speed = total_duration / transcription_elapsed
+        progress.update(
+            task_id,
+            total=max(total_duration, 0.001),
+            completed=max(total_duration, 0.001),
+            description="[green]Complete",
+            speed=f"done · {speed:.1f}× realtime",
+        )
         logging.info(
             f"Voila!✨ Your file has been transcribed go check it out over here 👉 {output_file_name}"
         )
@@ -173,6 +251,7 @@ def main():
     model_name = args.model_name
     youtube_url = args.youtube_url
     output_file_name = args.output_file_name
+
     def _derive_output_name(source_path: str) -> str:
         base, _ = os.path.splitext(os.path.basename(source_path))
         directory = os.path.dirname(source_path)
